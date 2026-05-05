@@ -893,6 +893,7 @@ public:
     PO.SkipImplicit = true;
     PO.AlwaysPrintNonSendableExtensions = false;
     PO.AlwaysTryPrintParameterLabels = true;
+    PO.PrintHomogeneousTuplesCompactly = true;
     return PO;
   }
 
