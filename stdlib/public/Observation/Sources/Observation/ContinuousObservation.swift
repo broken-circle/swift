@@ -160,7 +160,7 @@ extension ContinuousObservation.State {
     while await track(state, options: options, apply: apply) {}
   }
 
-  fileprivate static func track(
+  fileprivate nonisolated(nonsending) static func track(
     _ state: _ManagedCriticalState<ContinuousObservation.State>,
     options: ObservationTracking.Options,
     apply:
@@ -170,7 +170,7 @@ extension ContinuousObservation.State {
   ) async -> Bool {
     return await withTaskCancellationHandler(
       operation: {
-        return await withUnsafeContinuation(isolation: apply.isolation) {
+        return await withUnsafeContinuation {
           continuation in
           guard
             ContinuousObservation.State.populate(state, continuation: continuation)
@@ -203,8 +203,7 @@ extension ContinuousObservation.State {
       },
       onCancel: {
         ContinuousObservation.State.cancel(state)
-      },
-      isolation: apply.isolation
+      }
     )
   }
 }
