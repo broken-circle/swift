@@ -3327,6 +3327,77 @@ public:
     llvm_unreachable("bad context kind");
   }
 
+  void diagnoseUnhandledForEachThrowSite(DiagnosticEngine &Diags,
+                                         ForEachStmt *S, bool isTryCovered,
+                                         const PotentialEffectReason &reason) {
+    // Determine the fix-it location for inserting `try`, used by all 
+    // branches that suggest it. Insert before `await` if present, 
+    // otherwise before the pattern.
+    SourceLoc tryInsertLoc = S->getAwaitLoc().isValid()
+                                 ? S->getAwaitLoc()
+                                 : S->getPattern()->getStartLoc();
+    SourceLoc diagLoc = S->getForLoc();
+
+    auto emit = [&](Diag<> diagID) {
+      auto diag = Diags.diagnose(diagLoc, diagID);
+      if (!isTryCovered)
+        diag.fixItInsert(tryInsertLoc, "try ");
+    };
+
+    switch (getKind()) {
+    case Kind::PotentiallyHandled:
+      // If a `try` is already present and the throw does not require 
+      // special handling, emit `try_unhandled` on the `try` keyword to 
+      // match the existing diagnostic for cases like 
+      // `for try await _ in seq { }` in a non-throwing context.
+      if (isTryCovered &&
+          !reason.hasPolymorphicEffect() &&
+          !hasPolymorphicEffect(EffectKind::Throws)) {
+        Diags.diagnose(S->getTryLoc(), IsNonExhaustiveCatch
+          ? diag::try_unhandled_in_nonexhaustive_catch
+          : diag::try_unhandled);
+        return;
+      }
+
+      if (IsNonExhaustiveCatch) {
+        emit(diag::for_each_throwing_in_nonexhaustive_catch);
+        maybeAddRethrowsNote(Diags, diagLoc, reason);
+        return;
+      }
+
+      if (isDeferBody()) {
+        // No fix-it: a `try` cannot rescue a defer-body throw.
+        Diags.diagnose(diagLoc, diag::for_each_throwing_in_defer_body);
+        return;
+      }
+
+      if (hasPolymorphicEffect(EffectKind::Throws)) {
+        emit(diag::for_each_throwing_in_rethrows_function);
+        maybeAddRethrowsNote(Diags, diagLoc, reason);
+        return;
+      }
+
+      emit(diag::for_each_throwing_unhandled);
+      return;
+
+    case Kind::EnumElementInitializer:
+    case Kind::GlobalVarInitializer:
+    case Kind::LazyVarInitializer:
+    case Kind::IVarInitializer:
+    case Kind::DefaultArgument:
+    case Kind::PropertyWrapper:
+    case Kind::CatchPattern:
+    case Kind::CatchGuard:
+      // A `for-in` loop cannot syntactically appear in these contexts.
+      // Fall back to the generic diagnostic defensively.
+      Diags.diagnose(S->getStartLoc(), diag::throwing_op_in_illegal_context,
+                     static_cast<unsigned>(getKind()),
+                     getEffectSourceName(reason));
+      return;
+    }
+    llvm_unreachable("bad context kind");
+  }
+
   void diagnoseUnhandledThrowStmt(DiagnosticEngine &Diags, Stmt *S) {
     switch (getKind()) {
     case Kind::PotentiallyHandled:
@@ -3637,6 +3708,14 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
   /// The maximum combined value of all throwing expressions in the current
   /// context.
   ConditionalEffectKind MaxThrowingKind;
+
+  /// Set while walking the desugared body of a `ForEachStmt`. When set,
+  /// throwing diagnostics on synthesized iterator calls are suppressed.
+  /// The for-each-statement-level diagnostic (emitted from `checkForEach()`
+  /// after the desugared walk) provides loop-tailored wording instead.
+  /// Async, unsafe, and try-coverage diagnostics on those synthesized 
+  /// calls continue to fire normally.
+  bool InForEachDesugaredWalk = false;
 
   struct DiagnosticInfo {
     DiagnosticInfo(Expr &failingExpr,
@@ -4463,6 +4542,20 @@ private:
       bool isTryCovered =
         (!requiresTry || Flags.has(ContextFlags::IsTryCovered) ||
          Flags.has(ContextFlags::InAsyncLet));
+
+      // Inside the desugared body of a `for-in` loop, suppress throwing
+      // diagnostics on synthesized iterator calls. The for-each-statement-
+      // level diagnostic from `checkForEach` provides loop-tailored wording.
+      // We still compute and return the thrown error destination so SILGen
+      // and IRGen see the correct typed-throws bookkeeping.
+      if (InForEachDesugaredWalk) {
+        if (CurContext.handlesThrows(throwsKind) && isTryCovered) {
+          return checkThrownErrorType(
+              E.getStartLoc(), classification.getThrownError());
+        }
+        break;
+      }
+
       if (!CurContext.handlesThrows(throwsKind)) {
         CurContext.diagnoseUnhandledThrowSite(Ctx.Diags, E, isTryCovered,
                                               classification.getThrowReason());
@@ -4630,6 +4723,7 @@ private:
       // We enforce effects handling for the desugared statement below so no
       // need to handle that here.
       scope.assumeEffectsCovered();
+      llvm::SaveAndRestore<bool> inForEach(InForEachDesugaredWalk, true);
       desugared->walk(*this);
     }
 
@@ -4651,16 +4745,17 @@ private:
       if (throwsKind != ConditionalEffectKind::None)
         Flags.set(ContextFlags::HasAnyThrowSite);
 
-      // TODO: We ought to have a custom throws reason for this and unify the
-      // diagnostic handling (https://github.com/swiftlang/swift/issues/89124).
       auto tryLoc = S->getTryLoc();
       if (!CurContext.handlesThrows(throwsKind)) {
-        CurContext.diagnoseUnhandledThrowSite(Ctx.Diags, S, tryLoc.isValid(),
-                                              classification.getThrowReason());
+        CurContext.diagnoseUnhandledForEachThrowSite(
+            Ctx.Diags, S, tryLoc.isValid(), classification.getThrowReason());
         CurContext.diagnoseUnhandledTry(Ctx.Diags, tryLoc);
-      } else if (!tryLoc) {
-        Ctx.Diags.diagnose(S->getForLoc(), diag::for_throw_without_try)
-          .fixItInsertAfter(S->getForLoc(), " try");
+      } else if (!tryLoc.isValid()) {
+        SourceLoc tryInsertLoc = S->getAwaitLoc().isValid()
+                                    ? S->getAwaitLoc()
+                                    : S->getPattern()->getStartLoc();
+        Ctx.Diags.diagnose(S->getForLoc(), diag::for_each_throwing_without_try)
+          .fixItInsert(tryInsertLoc, "try ");
       }
     }
 
